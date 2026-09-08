@@ -1,0 +1,6 @@
+adaptive_binning/
+n=4000_delay_noise_5p_2*/
+graphs/
+latest_folder.txt
+__pycache__/
+*.pyc
