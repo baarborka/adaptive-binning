@@ -1,0 +1,17 @@
+alpha=-0.85
+beta=-2.0
+E0=100.0
+F0=1.0
+E_peak=3038.0
+t_start=0.0
+t_end=8.0
+n_time_points=800
+energy_bands=[(8, 63), (63, 500), (500, 3970), (3970, 31260), (31620, 251000), (251000, 1000000)]
+t_peak_min=2.0
+t_peak_max=2.05
+rise_index=35
+decay_index=-0.2
+adaptive_method='bayesian_blocks'
+bb_p0=0.1
+counts_per_bin=200
+reference_band_index=0

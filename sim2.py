@@ -10,19 +10,11 @@ from astropy.stats import bayesian_blocks
 # =============================================================================
 # CHANGES IN THIS VERSION
 # -----------------------------------------------------------------------------
-# Everything from the previous photon-level version is unchanged (continuous
-# per-photon energy sampling, per-photon energy-dependent delay, self-similar
-# arrival-time sampling). NEW in this version:
-#
-#   - Adaptive (Bayesian Blocks) binning, computed ONCE on a reference band's
-#     photon times, then applied via those SAME edges to every band. This
-#     keeps all channels on a common time grid, which cross-correlation /
-#     error-correlation both require.
-#   - Because Bayesian Blocks bins have unequal widths, counts are converted
-#     to a RATE (counts / bin width) before comparing/plotting -- raw counts
-#     would make wide bins look artificially brighter than narrow ones at the
-#     same true rate.
-#   - The original fixed-width binning/plots are kept as-is for comparison.
+# - Adaptive (Bayesian Blocks or Equal Counts) binning is now computed 
+#   INDEPENDENTLY for every energy channel.
+# - Because each channel has different bin edges and a different number of bins,
+#   the adaptive output is saved as a long-format CSV ('independent_adaptive_rates.csv').
+# - The original fixed-width binning/plots are kept as-is for comparison.
 # =============================================================================
 
 RNG_SEED = None  # set an integer here for reproducible runs
@@ -38,7 +30,7 @@ def format_energy_label(energy):
         return f'{energy:.2f} keV'
 
 
-flux_multiplier = 400
+flux_multiplier = 300
 
 # ---------------------------
 # Step 0: Folder creation
@@ -59,11 +51,7 @@ run_graphs_folder = output_folder
 
 
 def load_parameters(filename):
-    """Parse a simple key=value params file. Blank lines and lines starting
-    with '#' are skipped. Values are parsed with ast.literal_eval when
-    possible (numbers, lists, tuples, quoted strings); anything that fails
-    to parse as a literal is kept as a plain string (so both
-    adaptive_method=equal_counts and adaptive_method='equal_counts' work)."""
+    """Parse a simple key=value params file."""
     params = {}
     with open(filename, 'r') as file:
         for line_num, raw_line in enumerate(file, start=1):
@@ -262,40 +250,22 @@ csv_filename = output_folder / 'photon_counts_over_time.csv'
 df_photon_counts.to_csv(csv_filename, index=False)
 
 # ---------------------------
-# NEW: Adaptive binning -- settings now read from params.txt, with defaults
-# if the keys are absent (so old params.txt files still work unchanged).
-#
-# Add to params.txt, e.g.:
-#   adaptive_method='equal_counts'   # or 'bayesian_blocks' -- quotes matter,
-#                                     # load_parameters() uses ast.literal_eval
-#   bb_p0=0.01                       # only used if adaptive_method is bayesian_blocks
-#   counts_per_bin=50                # only used if adaptive_method is equal_counts
-#   reference_band_index=0
+# NEW: Independent Adaptive binning per channel
 # ---------------------------
 ADAPTIVE_METHOD = params.get('adaptive_method', 'equal_counts')
 BB_P0 = params.get('bb_p0', 0.01)
 COUNTS_PER_BIN = params.get('counts_per_bin', 50)
-REFERENCE_BAND_INDEX = params.get('reference_band_index', 0)
 
-print(f"Adaptive binning config -> method: {ADAPTIVE_METHOD}, "
-      f"bb_p0: {BB_P0}, counts_per_bin: {COUNTS_PER_BIN}, "
-      f"reference_band_index: {REFERENCE_BAND_INDEX}")
-
+print(f"Applying independent {ADAPTIVE_METHOD} binning to all channels...")
+print(f"Config -> bb_p0: {BB_P0}, counts_per_bin: {COUNTS_PER_BIN}")
 
 def equal_counts_edges(times, counts_per_bin):
-    """Bin edges such that each bin contains ~counts_per_bin photons.
-    Edges are placed at the midpoint between the last photon of one chunk
-    and the first photon of the next, so no photon sits exactly on an edge.
-    The final partial chunk (if len(times) % counts_per_bin != 0) is merged
-    into the last full bin rather than left as an under-populated bin."""
     times_sorted = np.sort(times)
     n = len(times_sorted)
     if n < 2 * counts_per_bin:
-        # too few photons to form more than one meaningful bin
         return np.array([times_sorted[0], times_sorted[-1]])
 
     chunk_starts = np.arange(counts_per_bin, n, counts_per_bin)
-    # drop the last split point if it would leave a tiny trailing bin
     if n - chunk_starts[-1] < counts_per_bin / 2:
         chunk_starts = chunk_starts[:-1]
 
@@ -306,64 +276,47 @@ def equal_counts_edges(times, counts_per_bin):
     edges.append(times_sorted[-1])
     return np.array(edges)
 
-
 if ADAPTIVE_METHOD not in ('equal_counts', 'bayesian_blocks'):
-    raise ValueError(
-        f"params.txt has adaptive_method='{ADAPTIVE_METHOD}', but only "
-        "'equal_counts' or 'bayesian_blocks' are supported. Check the "
-        "quoting in params.txt (ast.literal_eval requires quotes around "
-        "string values, e.g. adaptive_method='equal_counts')."
-    )
-if not (0 <= REFERENCE_BAND_INDEX < n_bands):
-    raise ValueError(
-        f"params.txt has reference_band_index={REFERENCE_BAND_INDEX}, "
-        f"but there are only {n_bands} energy bands (valid indices: "
-        f"0 to {n_bands - 1})."
-    )
+    raise ValueError("Invalid adaptive_method. Use 'equal_counts' or 'bayesian_blocks'.")
 
-reference_times = df_events[df_events['Energy_Band'] == REFERENCE_BAND_INDEX]['Time (s)'].values
+adaptive_data_list = []
+independent_plot_data = [] # Stores edges/rates for the plotting step
 
-if len(reference_times) > 1:
-    if ADAPTIVE_METHOD == 'equal_counts':
-        bb_edges = equal_counts_edges(reference_times, COUNTS_PER_BIN)
-    else:
-        bb_edges = bayesian_blocks(reference_times, fitness='events', p0=BB_P0)
-else:
-    print(f"WARNING: reference band has too few photons for {ADAPTIVE_METHOD} binning; "
-          "falling back to fixed-width edges.")
-    bb_edges = t_edges
-
-bb_widths = np.diff(bb_edges)
-bb_centers = 0.5 * (bb_edges[:-1] + bb_edges[1:])
-
-adaptive_data = {
-    'Bin Start (s)': bb_edges[:-1],
-    'Bin End (s)': bb_edges[1:],
-    'Bin Center (s)': bb_centers,
-}
-
-# Rate, not raw counts: with unequal bin widths, counts alone would make wide
-# bins look brighter than narrow ones even at the same true photon rate.
-adaptive_rates = np.zeros((n_bands, len(bb_centers)))
 for i, (E_min, E_max) in enumerate(energy_bands):
     band_times = df_events[df_events['Energy_Band'] == i]['Time (s)'].values
-    counts, _ = np.histogram(band_times, bins=bb_edges)
-    rate = (counts / bb_widths) / flux_multiplier
-    adaptive_rates[i, :] = rate
-    avg_energy = (E_min + E_max) / 2
-    adaptive_data[avg_energy] = rate
+    
+    if len(band_times) > 1:
+        if ADAPTIVE_METHOD == 'equal_counts':
+            edges = equal_counts_edges(band_times, COUNTS_PER_BIN)
+        else:
+            edges = bayesian_blocks(band_times, fitness='events', p0=BB_P0)
+    else:
+        print(f"WARNING: Band {i} has too few photons; falling back to fixed edges.")
+        edges = t_edges
+        
+    widths = np.diff(edges)
+    counts, _ = np.histogram(band_times, bins=edges)
+    rates = (counts / widths) / flux_multiplier
+    
+    independent_plot_data.append({'edges': edges, 'rates': rates})
+    
+    # Store each bin as a row in long-format for the CSV
+    band_df = pd.DataFrame({
+        'Band_Index': i,
+        'Avg_Energy': (E_min + E_max) / 2.0,
+        'Bin_Start': edges[:-1],
+        'Bin_End': edges[1:],
+        'Rate': rates
+    })
+    adaptive_data_list.append(band_df)
 
-df_adaptive = pd.DataFrame(adaptive_data)
-adaptive_csv_filename = output_folder / 'adaptive_photon_rates_over_time.csv'
+df_adaptive = pd.concat(adaptive_data_list, ignore_index=True)
+adaptive_csv_filename = output_folder / 'independent_adaptive_rates.csv'
 df_adaptive.to_csv(adaptive_csv_filename, index=False)
-print(f"{ADAPTIVE_METHOD} binning produced {len(bb_centers)} adaptive bins "
-      f"(edges derived from band {REFERENCE_BAND_INDEX}, applied to all bands).")
+print(f"Saved independent adaptive bins to {adaptive_csv_filename.name}")
 
 
 def save_plot(category, filename_stub, fig=None):
-    """Save the current (or given) matplotlib figure into both the shared,
-    timestamped 'graphs' archive and this run's own folder (fixed filename,
-    easy to find). category is the subfolder name under common_graphs_folder."""
     timestamp = int(time.time() * 1000)
     common_folder = common_graphs_folder / category
     common_folder.mkdir(parents=True, exist_ok=True)
@@ -398,12 +351,17 @@ plt.tight_layout()
 save_plot('combined_photon_counts', 'combined_photon_counts', fig=fig)
 
 # ---------------------------
-# Plot 1b: Adaptive-binned rate, same layout as Plot 1
+# Plot 1b: Independent Adaptive-binned rate
 # ---------------------------
 fig, axs = plt.subplots(n_rows, n_cols, figsize=(12, 6), sharex=True)
 for i, (E_min, E_max) in enumerate(energy_bands):
     ax = axs[i // n_cols, i % n_cols]
-    ax.step(bb_edges[:-1], adaptive_rates[i, :], where='post', color='hotpink')
+    
+    # Retrieve the specific edges and rates for this channel
+    edges = independent_plot_data[i]['edges']
+    rates = independent_plot_data[i]['rates']
+    
+    ax.step(edges[:-1], rates, where='post', color='hotpink')
     label_min = format_energy_label(E_min)
     label_max = format_energy_label(E_max)
     ax.set_title(f'{ADAPTIVE_METHOD} Rate: {label_min} - {label_max}')
@@ -414,7 +372,7 @@ for j in range(i + 1, n_rows * n_cols):
 axs[-1, 0].set_xlabel('Time (s)')
 axs[-1, 1].set_xlabel('Time (s)')
 plt.tight_layout()
-save_plot('adaptive_photon_rates', 'adaptive_photon_rates', fig=fig)
+save_plot('independent_adaptive_rates', 'independent_adaptive_rates', fig=fig)
 
 # ---------------------------
 # Plot 2: Band Function Spectrum
@@ -495,5 +453,7 @@ with open(params_filename, 'w') as f:
         f.write(f"Bayesian Blocks p0: {BB_P0}\n")
     elif ADAPTIVE_METHOD == 'equal_counts':
         f.write(f"Counts per bin: {COUNTS_PER_BIN}\n")
-    f.write(f"Adaptive binning reference band index: {REFERENCE_BAND_INDEX}\n")
-    f.write(f"Adaptive binning number of bins: {len(bb_centers)}\n")
+        
+    f.write(f"\n--- Independent Bin Counts ---\n")
+    for i, p_data in enumerate(independent_plot_data):
+        f.write(f"Band {i}: {len(p_data['rates'])} bins\n")
